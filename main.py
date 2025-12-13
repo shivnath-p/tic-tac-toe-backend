@@ -1,87 +1,112 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Dict
+import asyncio
 
 app = FastAPI()
 
-rooms = {}
-
+rooms: Dict[str, dict] = {}
 
 @app.get("/")
 def home():
     return {"status": "Tic Tac Toe WebSocket server is running"}
 
-
 def check_winner(board, n):
     lines = []
+    win_indices = []
 
+    # Rows & columns
     for i in range(n):
-        lines.append(board[i*n:(i+1)*n])
-        lines.append([board[j*n+i] for j in range(n)])
+        row = [i*n + j for j in range(n)]
+        col = [j*n + i for j in range(n)]
+        lines.append(row)
+        lines.append(col)
 
-    lines.append([board[i*n+i] for i in range(n)])
-    lines.append([board[(i+1)*n-(i+1)] for i in range(n)])
+    # Diagonals
+    lines.append([i*n + i for i in range(n)])
+    lines.append([(i+1)*n - (i+1) for i in range(n)])
 
     for line in lines:
-        if line[0] and all(cell == line[0] for cell in line):
-            return line, line[0]
+        values = [board[i] for i in line]
+        if values[0] and all(v == values[0] for v in values):
+            return values[0], line
 
     if None not in board:
-        return [], "Draw"
+        return "Draw", []
 
-    return [], None
+    return None, []
 
-
-@app.websocket("/ws/{room_id}/{size}")
-async def websocket_endpoint(ws: WebSocket, room_id: str, size: int):
+@app.websocket("/ws/{room}")
+async def ws_game(ws: WebSocket, room: str):
     await ws.accept()
 
-    if room_id not in rooms:
-        rooms[room_id] = {
-            "board": [None] * (size * size),
-            "turn": "X",
+    if room not in rooms:
+        rooms[room] = {
             "players": [],
-            "size": size
+            "spectators": [],
+            "board": [],
+            "turn": 0,
+            "names": [],
+            "wins": [0, 0],
+            "grid": 3,
+            "timer": 15,
+            "winner": None,
+            "win_line": []
         }
 
-    room = rooms[room_id]
+    game = rooms[room]
 
-    # ❌ STEP 4: BLOCK 3rd PLAYER
-    if len(room["players"]) >= 2:
-        await ws.send_json({"error": "Room is full"})
-        await ws.close()
-        return
-
-    symbol = "X" if len(room["players"]) == 0 else "O"
-    room["players"].append({"ws": ws, "symbol": symbol})
-
-    await ws.send_json({
-        "symbol": symbol,
-        "board": room["board"],
-        "turn": room["turn"],
-        "winner": None,
-        "winLine": []
-    })
+    if len(game["players"]) < 2:
+        player_id = len(game["players"])
+        game["players"].append(ws)
+    else:
+        game["spectators"].append(ws)
+        player_id = -1
 
     try:
         while True:
             data = await ws.receive_json()
-            idx = data.get("index")
 
-            if room["turn"] != symbol:
-                continue
+            if data["type"] == "join":
+                if player_id != -1:
+                    game["names"].append(data["name"])
+                game["grid"] = data["grid"]
+                game["timer"] = data["timer"]
+                game["board"] = [None] * (game["grid"] ** 2)
+                game["turn"] = 0
+                game["winner"] = None
+                game["win_line"] = []
 
-            if room["board"][idx] is None:
-                room["board"][idx] = symbol
-                room["turn"] = "O" if symbol == "X" else "X"
+            if data["type"] == "move" and player_id == game["turn"]:
+                idx = data["index"]
+                if game["board"][idx] is None and not game["winner"]:
+                    game["board"][idx] = player_id
+                    winner, line = check_winner(game["board"], game["grid"])
+                    if winner is not None:
+                        game["winner"] = winner
+                        game["win_line"] = line
+                        if winner != "Draw":
+                            game["wins"][winner] += 1
+                    game["turn"] = 1 - game["turn"]
 
-            winLine, winner = check_winner(room["board"], room["size"])
+            if data["type"] == "reset":
+                game["board"] = [None] * (game["grid"] ** 2)
+                game["turn"] = 0
+                game["winner"] = None
+                game["win_line"] = []
 
-            for p in room["players"]:
-                await p["ws"].send_json({
-                    "board": room["board"],
-                    "turn": room["turn"],
-                    "winner": winner,
-                    "winLine": winLine
-                })
+            payload = {
+                "board": game["board"],
+                "turn": game["turn"],
+                "names": game["names"],
+                "wins": game["wins"],
+                "winner": game["winner"],
+                "win_line": game["win_line"],
+                "grid": game["grid"]
+            }
+
+            for p in game["players"] + game["spectators"]:
+                await p.send_json(payload)
 
     except WebSocketDisconnect:
-        room["players"] = [p for p in room["players"] if p["ws"] != ws]
+        if player_id != -1:
+            game["players"].remove(ws)
