@@ -1,29 +1,21 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import Dict
-import asyncio
 
 app = FastAPI()
-
-rooms: Dict[str, dict] = {}
+rooms = {}
 
 @app.get("/")
 def home():
-    return {"status": "Tic Tac Toe WebSocket server is running"}
+    return {"status": "Server running"}
 
 def check_winner(board, n):
     lines = []
-    win_indices = []
 
-    # Rows & columns
     for i in range(n):
-        row = [i*n + j for j in range(n)]
-        col = [j*n + i for j in range(n)]
-        lines.append(row)
-        lines.append(col)
+        lines.append([(i*n+j) for j in range(n)])
+        lines.append([(j*n+i) for j in range(n)])
 
-    # Diagonals
-    lines.append([i*n + i for i in range(n)])
-    lines.append([(i+1)*n - (i+1) for i in range(n)])
+    lines.append([i*n+i for i in range(n)])
+    lines.append([(i+1)*n-(i+1) for i in range(n)])
 
     for line in lines:
         values = [board[i] for i in line]
@@ -35,78 +27,57 @@ def check_winner(board, n):
 
     return None, []
 
-@app.websocket("/ws/{room}")
-async def ws_game(ws: WebSocket, room: str):
+@app.websocket("/ws/{room}/{size}")
+async def ws(ws: WebSocket, room: str, size: int):
     await ws.accept()
 
     if room not in rooms:
         rooms[room] = {
+            "board": [None]*(size*size),
+            "turn": "P1",
             "players": [],
             "spectators": [],
-            "board": [],
-            "turn": 0,
-            "names": [],
-            "wins": [0, 0],
-            "grid": 3,
-            "timer": 15,
-            "winner": None,
-            "win_line": []
+            "wins": {"P1": 0, "P2": 0},
+            "size": size
         }
 
-    game = rooms[room]
+    data = rooms[room]
 
-    if len(game["players"]) < 2:
-        player_id = len(game["players"])
-        game["players"].append(ws)
+    role = "spectator"
+    if len(data["players"]) < 2:
+        role = f"P{len(data['players'])+1}"
+        data["players"].append(ws)
     else:
-        game["spectators"].append(ws)
-        player_id = -1
+        data["spectators"].append(ws)
 
     try:
         while True:
-            data = await ws.receive_json()
+            msg = await ws.receive_json()
 
-            if data["type"] == "join":
-                if player_id != -1:
-                    game["names"].append(data["name"])
-                game["grid"] = data["grid"]
-                game["timer"] = data["timer"]
-                game["board"] = [None] * (game["grid"] ** 2)
-                game["turn"] = 0
-                game["winner"] = None
-                game["win_line"] = []
+            if msg["type"] == "move" and role == data["turn"]:
+                idx = msg["index"]
+                if data["board"][idx] is None:
+                    data["board"][idx] = role
+                    winner, line = check_winner(data["board"], size)
+                    if winner in ["P1", "P2"]:
+                        data["wins"][winner] += 1
+                    data["turn"] = "P2" if data["turn"] == "P1" else "P1"
 
-            if data["type"] == "move" and player_id == game["turn"]:
-                idx = data["index"]
-                if game["board"][idx] is None and not game["winner"]:
-                    game["board"][idx] = player_id
-                    winner, line = check_winner(game["board"], game["grid"])
-                    if winner is not None:
-                        game["winner"] = winner
-                        game["win_line"] = line
-                        if winner != "Draw":
-                            game["wins"][winner] += 1
-                    game["turn"] = 1 - game["turn"]
-
-            if data["type"] == "reset":
-                game["board"] = [None] * (game["grid"] ** 2)
-                game["turn"] = 0
-                game["winner"] = None
-                game["win_line"] = []
+            if msg["type"] == "reset":
+                data["board"] = [None]*(size*size)
+                data["turn"] = "P1"
 
             payload = {
-                "board": game["board"],
-                "turn": game["turn"],
-                "names": game["names"],
-                "wins": game["wins"],
-                "winner": game["winner"],
-                "win_line": game["win_line"],
-                "grid": game["grid"]
+                "board": data["board"],
+                "turn": data["turn"],
+                "wins": data["wins"],
+                "role": role,
+                "winner": check_winner(data["board"], size)[0],
+                "line": check_winner(data["board"], size)[1]
             }
 
-            for p in game["players"] + game["spectators"]:
-                await p.send_json(payload)
+            for c in data["players"] + data["spectators"]:
+                await c.send_json(payload)
 
     except WebSocketDisconnect:
-        if player_id != -1:
-            game["players"].remove(ws)
+        pass
