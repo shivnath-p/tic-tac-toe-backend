@@ -5,6 +5,10 @@ import random
 import time
 
 app = FastAPI()
+@app.get("/")
+def home():
+    return {"status": "Tic Tac Toe WebSocket server is running"}
+
 
 rooms: Dict[str, dict] = {}
 
@@ -176,3 +180,4 @@ async def ws_game(ws: WebSocket, room_id: str):
         room["winner"] = None
         room["win_line"] = []
         room["time_left"] = room["timer"]
+
