@@ -1,107 +1,178 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import Dict
+from typing import Dict, List, Optional
+import asyncio
+import random
 import time
 
 app = FastAPI()
+
 rooms: Dict[str, dict] = {}
 
-@app.get("/")
-def home():
-    return {"status": "Tic Tac Toe WebSocket server is running"}
 
-def check_winner(board, n):
+def check_winner(board: List[Optional[int]], n: int):
     lines = []
 
+    # rows & cols
     for i in range(n):
-        lines.append(board[i*n:(i+1)*n])
-        lines.append([board[j*n+i] for j in range(n)])
+        lines.append([i * n + j for j in range(n)])
+        lines.append([j * n + i for j in range(n)])
 
-    lines.append([board[i*n+i] for i in range(n)])
-    lines.append([board[(i+1)*n-(i+1)] for i in range(n)])
+    # diagonals
+    lines.append([i * n + i for i in range(n)])
+    lines.append([(i + 1) * n - (i + 1) for i in range(n)])
 
-    for idx, line in enumerate(lines):
-        if line[0] and all(cell == line[0] for cell in line):
-            return line[0], idx
+    for line in lines:
+        values = [board[i] for i in line]
+        if values[0] is not None and all(v == values[0] for v in values):
+            return values[0], line
 
     if None not in board:
-        return "Draw", None
+        return "Draw", []
 
-    return None, None
+    return None, []
+
+
+def ai_move(board):
+    empty = [i for i, v in enumerate(board) if v is None]
+    return random.choice(empty) if empty else None
 
 
 @app.websocket("/ws/{room_id}")
-async def websocket_endpoint(ws: WebSocket, room_id: str):
+async def ws_game(ws: WebSocket, room_id: str):
     await ws.accept()
 
+    # Create room if not exists
     if room_id not in rooms:
         rooms[room_id] = {
             "players": [],
             "spectators": [],
-            "board": [None]*9,
+            "names": [None, None],
+            "board": [],
             "turn": 0,
-            "names": {},
-            "wins": {"p1": 0, "p2": 0},
+            "wins": [0, 0],
+            "grid": 3,
+            "winner": None,
+            "win_line": [],
             "timer": 15,
-            "last_move": time.time()
+            "time_left": 15,
+            "last_tick": time.time(),
+            "ai_enabled": False
         }
 
     room = rooms[room_id]
 
-    role = "spectator"
+    # Assign role
     if len(room["players"]) < 2:
-        role = "player"
+        player_id = len(room["players"])
         room["players"].append(ws)
     else:
         room["spectators"].append(ws)
+        player_id = -1
 
     try:
         while True:
             data = await ws.receive_json()
 
             if data["type"] == "join":
-                room["names"][ws] = data["name"]
+                if player_id != -1:
+                    room["names"][player_id] = data["name"]
 
-            if data["type"] == "move" and role == "player":
+                if player_id == 0:
+                    room["grid"] = data.get("grid", 3)
+                    room["timer"] = data.get("timer", 15)
+                    room["ai_enabled"] = data.get("ai", False)
+
+                    room["board"] = [None] * (room["grid"] ** 2)
+                    room["turn"] = 0
+                    room["winner"] = None
+                    room["win_line"] = []
+                    room["time_left"] = room["timer"]
+                    room["last_tick"] = time.time()
+
+            if (
+                data["type"] == "move"
+                and player_id == room["turn"]
+                and room["winner"] is None
+            ):
                 idx = data["index"]
-                if room["board"][idx] is None:
-                    symbol = "X" if room["turn"] == 0 else "O"
-                    room["board"][idx] = symbol
-                    room["turn"] = 1 - room["turn"]
-                    room["last_move"] = time.time()
+                if 0 <= idx < len(room["board"]) and room["board"][idx] is None:
+                    room["board"][idx] = player_id
+                    winner, line = check_winner(room["board"], room["grid"])
+                    if winner is not None:
+                        room["winner"] = winner
+                        room["win_line"] = line
+                        if winner != "Draw":
+                            room["wins"][winner] += 1
+                    else:
+                        room["turn"] = 1 - room["turn"]
+                        room["time_left"] = room["timer"]
+                        room["last_tick"] = time.time()
 
-                    winner, line = check_winner(room["board"], 3)
-                    if winner == "X":
-                        room["wins"]["p1"] += 1
-                    elif winner == "O":
-                        room["wins"]["p2"] += 1
+            if (
+                room["ai_enabled"]
+                and room["turn"] == 1
+                and room["winner"] is None
+                and len(room["players"]) == 1
+            ):
+                await asyncio.sleep(0.6)
+                move = ai_move(room["board"])
+                if move is not None:
+                    room["board"][move] = 1
+                    winner, line = check_winner(room["board"], room["grid"])
+                    if winner is not None:
+                        room["winner"] = winner
+                        room["win_line"] = line
+                        if winner != "Draw":
+                            room["wins"][winner] += 1
+                    else:
+                        room["turn"] = 0
+                        room["time_left"] = room["timer"]
+                        room["last_tick"] = time.time()
 
-                    payload = {
-                        "board": room["board"],
-                        "turn": room["turn"],
-                        "winner": winner,
-                        "line": line,
-                        "wins": room["wins"],
-                        "names": list(room["names"].values())
-                    }
+            if room["winner"] is None:
+                now = time.time()
+                elapsed = int(now - room["last_tick"])
+                if elapsed > 0:
+                    room["time_left"] -= elapsed
+                    room["last_tick"] = now
 
-                    for client in room["players"] + room["spectators"]:
-                        await client.send_json(payload)
+                    if room["time_left"] <= 0:
+                        room["turn"] = 1 - room["turn"]
+                        room["time_left"] = room["timer"]
 
-            if data["type"] == "reset":
-                room["board"] = [None]*9
+            if data["type"] == "reset" and player_id == 0:
+                room["board"] = [None] * (room["grid"] ** 2)
                 room["turn"] = 0
-                for client in room["players"] + room["spectators"]:
-                    await client.send_json({
-                        "board": room["board"],
-                        "turn": room["turn"],
-                        "winner": None,
-                        "line": None,
-                        "wins": room["wins"],
-                        "names": list(room["names"].values())
-                    })
+                room["winner"] = None
+                room["win_line"] = []
+                room["time_left"] = room["timer"]
+                room["last_tick"] = time.time()
+
+            payload = {
+                "board": room["board"],
+                "turn": room["turn"],
+                "names": room["names"],
+                "wins": room["wins"],
+                "winner": room["winner"],
+                "win_line": room["win_line"],
+                "grid": room["grid"],
+                "time_left": room["time_left"],
+                "ai": room["ai_enabled"]
+            }
+
+            for client in room["players"] + room["spectators"]:
+                await client.send_json(payload)
 
     except WebSocketDisconnect:
-        if ws in room["players"]:
-            room["players"].remove(ws)
-        if ws in room["spectators"]:
-            room["spectators"].remove(ws)
+        if player_id != -1:
+            if ws in room["players"]:
+                room["players"].remove(ws)
+        else:
+            if ws in room["spectators"]:
+                room["spectators"].remove(ws)
+
+        room["board"] = [None] * (room["grid"] ** 2)
+        room["turn"] = 0
+        room["winner"] = None
+        room["win_line"] = []
+        room["time_left"] = room["timer"]
